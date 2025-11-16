@@ -1,9 +1,13 @@
 const Room = require('../models/Room');
+const RoomModel = require('../models/RoomModel');
 const generatePIN = require('../utils/pinGenerator');
 const { registerSession, validateSession, removeSession, getSessionByIp } = require('./DeviceSessionController');
 const Message = require('../models/Message');
 const DeviceSession = require('../models/DeviceSession');
+const RoomMembership = require('../models/RoomMembership');
 const { uploadToCloudinary } = require('../utils/fileUploader');
+const { FileSecurityService } = require('../services/fileSecurityService');
+const { AuditService } = require('../services/auditService');
 
 const rooms = {};
 
@@ -15,9 +19,21 @@ const refreshingUsers = new Set();
 
 // funcion auxiliar para obtener ip del cliente
 const getClientIp = (socket) => {
-  return socket.handshake.headers['x-forwarded-for']?.split(',')[0] || 
-         socket.handshake.address || 
-         socket.conn.remoteAddress;
+  const ip = socket.handshake.headers['x-forwarded-for']?.split(',')[0] || 
+             socket.handshake.address || 
+             socket.conn.remoteAddress;
+  
+  // Limpiar la IP si viene con ::ffff:
+  const cleanIp = ip.replace('::ffff:', '');
+  console.log(`📍 IP detectada - Original: ${ip}, Limpia: ${cleanIp}`);
+  return cleanIp;
+};
+
+// funcion para detectar info del navegador basado en el deviceId y user-agent
+const getBrowserInfo = (deviceId) => {
+  // El deviceId es único por navegador/sesión, pero podemos inferir algunos patrones
+  const timestamp = new Date().toLocaleTimeString();
+  return `otro navegador/ventana (ID: ${deviceId.slice(-8)})`;
 };
 
 function RoomController(io) {
@@ -25,77 +41,12 @@ function RoomController(io) {
     const clientIp = getClientIp(socket);
     console.log(`Nuevo cliente conectado: ${socket.id} desde IP: ${clientIp}`);
 
-    // crear sala
-    socket.on('createRoom', async ({ limit, nickname, deviceId }, callback) => {
-      try {
-        const clientIp = getClientIp(socket);
-        
-        // validar datos de entrada
-        if (!nickname || !deviceId || !limit) {
-          return callback({ success: false, message: 'Datos incompletos' });
-        }
-        
-        // validar longitud de nickname (maximo 12 caracteres)
-        if (nickname.length > 12) {
-          return callback({ success: false, message: 'El nombre no puede exceder 12 caracteres' });
-        }
-        
-        // validar limite de usuarios (maximo 10)
-        if (limit > 10 || limit < 2) {
-          return callback({ success: false, message: 'El limite debe estar entre 2 y 10 usuarios' });
-        }
-        
-        // verificar si esta ip ya tiene una sesion activa en cualquier sala
-        const existingSession = await DeviceSession.findOne({ ip: clientIp });
-        if (existingSession) {
-          // verificar si la sala de la sesion antigua todavia existe
-          const oldRoom = rooms[existingSession.roomPin];
-          if (!oldRoom) {
-            // la sala ya no existe, limpiar la sesion huerfana
-            console.log(`Limpiando sesion huerfana para IP ${clientIp} en sala ${existingSession.roomPin}`);
-            await DeviceSession.deleteOne({ ip: clientIp });
-          } else {
-            return callback({ 
-              success: false, 
-              message: 'Ya tienes una sesion activa. Cierra la otra sala primero.' 
-            });
-          }
-        }
-
-        // validar maximo de 15 salas activas
-        const MAX_ROOMS = 15;
-        const activeRoomsCount = Object.keys(rooms).length;
-
-        if (activeRoomsCount >= MAX_ROOMS) {
-          return callback({ success: false, message: 'Se ha alcanzado el limite maximo de salas activas (15).' });
-        }
-
-        const existingPins = Object.keys(rooms);
-        const pin = generatePIN(existingPins);
-        const room = new Room(pin, limit);
-        rooms[pin] = room;
-
-        await registerSession(deviceId, clientIp, pin, nickname);
-
-        room.addUser(socket.id, nickname, deviceId);
-        socket.join(pin);
-        socket.clientIp = clientIp;
-        socket.userPin = pin;
-        socket.userNickname = nickname;
-
-        // al crear la sala se garantiza que no haya temporizador pendiente
-        if (deletionTimers[pin]) {
-          clearTimeout(deletionTimers[pin]);
-          delete deletionTimers[pin];
-        }
-
-        console.log(`Sala creada con PIN: ${pin} por ${nickname} (IP: ${clientIp})`);
-        io.to(pin).emit('userJoined', { userId: socket.id, nickname, count: room.users.length, limit: room.limit });
-        callback({ success: true, pin });
-      } catch (err) {
-        console.error('Error en createRoom:', err);
-        callback({ success: false, message: err.message });
-      }
+    // crear sala - DESHABILITADO (solo admin puede crear salas)
+    socket.on('createRoom', async ({ limit, nickname, deviceId, type, name }, callback) => {
+      return callback({ 
+        success: false, 
+        message: 'Solo los administradores pueden crear salas. Por favor, únete a una sala existente.' 
+      });
     });
 
     // unirse a sala
@@ -110,28 +61,81 @@ function RoomController(io) {
         return callback({ success: false, message: 'El nombre no puede exceder 12 caracteres' });
       }
       
-      const room = rooms[pin];
+      let room = rooms[pin];
+      
+      // Si la sala no está en memoria, buscar en MongoDB
+      if (!room) {
+        try {
+          const roomDocument = await RoomModel.findOne({ pin: pin, isActive: true });
+          if (roomDocument) {
+            // Cargar sala desde MongoDB a memoria
+            room = new Room(
+              roomDocument.pin, 
+              roomDocument.maxParticipants, 
+              roomDocument.roomType, 
+              roomDocument.name
+            );
+            rooms[pin] = room;
+            console.log(`✅ Sala ${pin} cargada desde MongoDB a memoria`);
+          }
+        } catch (dbError) {
+          console.error('Error buscando sala en MongoDB:', dbError);
+        }
+      }
+      
       if (!room) return callback({ success: false, message: 'PIN invalido.' });
       if (room.isFull()) return callback({ success: false, message: 'La sala esta llena.' });
 
       try {
         const clientIp = getClientIp(socket);
         
-        // verificar si esta ip ya tiene una sesion activa en otra sala
-        const existingSession = await DeviceSession.findOne({ ip: clientIp });
-        if (existingSession && existingSession.roomPin !== pin) {
-          // verificar si la sala antigua todavia existe
-          const oldRoom = rooms[existingSession.roomPin];
-          if (!oldRoom) {
-            // la sala ya no existe, limpiar la sesion huerfana
-            console.log(`Limpiando sesion huerfana para IP ${clientIp} en sala ${existingSession.roomPin}`);
-            await DeviceSession.deleteOne({ ip: clientIp });
-          } else {
+        console.log(`🔍 Cliente intentando unirse: IP=${clientIp}, PIN=${pin}, deviceId=${deviceId}`);
+        
+        // 🔒 VALIDACIÓN CRÍTICA POR IP: Una IP = Una sala (sin importar navegador/incógnito)
+        // Buscar si esta IP ya está en CUALQUIER sala activa
+        const existingSessions = await DeviceSession.find({ ip: clientIp });
+        console.log(`📋 Sesiones encontradas para IP ${clientIp}:`, existingSessions.length);
+        
+        for (const session of existingSessions) {
+          console.log(`  - Sesión: PIN=${session.roomPin}, deviceId=${session.deviceId}, nickname=${session.nickname}`);
+        }
+        
+        const ipInAnyRoom = existingSessions[0]; // Tomar la primera sesión encontrada
+        
+        if (ipInAnyRoom) {
+          console.log(`🔍 IP ${clientIp} encontrada en sala: ${ipInAnyRoom.roomPin}, intentando acceder a: ${pin}`);
+          
+          // 🔒 BLOQUEAR CUALQUIER ACCESO DESDE OTRO NAVEGADOR
+          // Comparar deviceId para detectar si es el mismo navegador o uno diferente
+          if (ipInAnyRoom.deviceId !== deviceId) {
+            // Es un navegador/sesión diferente - BLOQUEAR COMPLETAMENTE
+            console.log(`❌ BLOQUEADO: IP ${clientIp} ya tiene sesión activa desde otro navegador (deviceId: ${ipInAnyRoom.deviceId})`);
+            
+            // Detectar tipo de navegador basado en deviceId anterior
+            const browserInfo = getBrowserInfo(ipInAnyRoom.deviceId);
+            
             return callback({ 
               success: false, 
-              message: 'Ya tienes una sesion activa en otra sala. Cierra esa sala primero.' 
+              message: `⚠️ ACCESO BLOQUEADO\n\nEste dispositivo ya tiene una sesión activa en la sala ${ipInAnyRoom.roomPin} desde ${browserInfo}.\n\n🔹 Usuario: ${ipInAnyRoom.nickname}\n🔹 Activo desde: ${new Date(ipInAnyRoom.lastActive).toLocaleString()}\n\n📋 Para acceder:\n1. Cierre TODAS las ventanas del navegador actual\n2. Vaya al otro navegador y haga clic en "Salir"\n3. O borre el caché/cookies del navegador actual\n\n⚡ Solo puede estar en UNA sala por dispositivo.` 
             });
           }
+          
+          // Es el mismo navegador - permitir reconexión
+          if (ipInAnyRoom.roomPin === pin) {
+            console.log(`✅ IP ${clientIp} reconectando desde el mismo navegador a sala ${pin}`);
+            ipInAnyRoom.nickname = nickname;
+            ipInAnyRoom.lastActive = Date.now();
+            await ipInAnyRoom.save();
+          } else {
+            // Mismo navegador pero diferente sala - bloquear
+            console.log(`❌ BLOQUEADO: Mismo navegador intenta cambiar de sala ${ipInAnyRoom.roomPin} a ${pin}`);
+            return callback({ 
+              success: false, 
+              message: `Ya estás en la sala ${ipInAnyRoom.roomPin}. Debes salir de esa sala antes de unirte a otra.` 
+            });
+          }
+        } else {
+          console.log(`✅ IP ${clientIp} no tiene sesiones activas, permitiendo acceso a sala ${pin}`);
         }
 
         await registerSession(deviceId, clientIp, pin, nickname);
@@ -140,6 +144,25 @@ function RoomController(io) {
         socket.clientIp = clientIp;
         socket.userPin = pin;
         socket.userNickname = nickname;
+
+        // ✅ CREAR O ACTUALIZAR ROOM MEMBERSHIP
+        try {
+          await RoomMembership.createOrUpdate(deviceId, nickname, pin, clientIp);
+          console.log(`✅ RoomMembership creado/actualizado para ${nickname} en sala ${pin}`);
+        } catch (membershipError) {
+          console.error('⚠️ Error creando RoomMembership:', membershipError);
+        }
+
+        // ✅ ACTUALIZAR CONTADOR EN MONGODB
+        try {
+          const roomDocument = await RoomModel.findOne({ pin: pin });
+          if (roomDocument) {
+            await roomDocument.incrementParticipants();
+            console.log(`✅ Participantes en BD actualizados: ${roomDocument.participantCount}`);
+          }
+        } catch (dbError) {
+          console.error('⚠️ Error actualizando participantes en MongoDB:', dbError);
+        }
 
         // cancelar cualquier temporizador de eliminacion
         if (deletionTimers[pin]) {
@@ -157,7 +180,8 @@ function RoomController(io) {
         socket.emit('isLastUser', room.users.length === 1);
 
         console.log(`${nickname} se unio a sala ${pin} (IP: ${clientIp})`);
-        callback({ success: true, pin });
+        console.log(`🔍 Tipo de sala: ${room.roomType}`);
+        callback({ success: true, pin, roomType: room.roomType });
       } catch (err) {
         console.error('Error en joinRoom:', err);
         callback({ success: false, message: err.message });
@@ -181,7 +205,27 @@ function RoomController(io) {
     socket.on('reconnectToRoom', async ({ pin, nickname, deviceId }, callback) => {
       try {
         const clientIp = getClientIp(socket);
-        const room = rooms[pin];
+        let room = rooms[pin];
+        
+        // Si la sala no está en memoria, buscar en MongoDB
+        if (!room) {
+          try {
+            const roomDocument = await RoomModel.findOne({ pin: pin, isActive: true });
+            if (roomDocument) {
+              // Cargar sala desde MongoDB a memoria
+              room = new Room(
+                roomDocument.pin, 
+                roomDocument.maxParticipants, 
+                roomDocument.roomType, 
+                roomDocument.name
+              );
+              rooms[pin] = room;
+              console.log(`✅ Sala ${pin} cargada desde MongoDB a memoria (reconnect)`);
+            }
+          } catch (dbError) {
+            console.error('Error buscando sala en MongoDB:', dbError);
+          }
+        }
         
         if (!room) {
           return callback({ success: false, message: 'Sala no encontrada' });
@@ -191,14 +235,17 @@ function RoomController(io) {
         const key = `${pin}:${deviceId}`;
         refreshingUsers.delete(key);
 
-        // buscar sesion por ip
+        // 🔒 BUSCAR SESIÓN POR IP (no por deviceId, ya que puede cambiar entre navegadores)
         const session = await getSessionByIp(clientIp, pin);
         if (!session) {
-          return callback({ success: false, message: 'Sesion no valida o expirada' });
+          console.log(`❌ No hay sesión válida para IP ${clientIp} en sala ${pin}`);
+          return callback({ success: false, message: 'Sesion no valida o expirada para este dispositivo' });
         }
 
-        // buscar si el usuario ya existe en la sala con la misma ip
-        const existingUserIndex = room.users.findIndex(u => u.id === socket.id);
+        console.log(`✅ Sesión encontrada para IP ${clientIp}: ${session.nickname} en sala ${pin}`);
+
+        // buscar si el usuario ya existe en la sala
+        const existingUserIndex = room.users.findIndex(u => u.deviceId === deviceId);
         
         if (existingUserIndex !== -1) {
           // actualizar el socket id manteniendo el resto de la informacion
@@ -227,7 +274,7 @@ function RoomController(io) {
           socket.emit('previousMessages', previousMessages);
           
           console.log(`Usuario ${session.nickname} reconectado correctamente (IP: ${clientIp})`);
-          return callback({ success: true, pin });
+          return callback({ success: true, pin, roomType: room.roomType });
         }
 
         // si no existe en la sala pero tiene sesion valida, agregar
@@ -241,6 +288,23 @@ function RoomController(io) {
         socket.clientIp = clientIp;
         socket.userPin = pin;
         socket.userNickname = session.nickname;
+        
+        // ✅ RECONECTAR ROOM MEMBERSHIP
+        try {
+          // Buscar por IP ya que el deviceId puede haber cambiado
+          const membership = await RoomMembership.findOne({ ip: clientIp, roomPin: pin });
+          if (membership) {
+            membership.deviceId = deviceId; // Actualizar deviceId
+            await membership.reconnect();
+            console.log(`✅ RoomMembership reconectado para ${session.nickname} en sala ${pin}`);
+          } else {
+            // Si no existe, crearlo
+            await RoomMembership.createOrUpdate(deviceId, session.nickname, pin, clientIp);
+            console.log(`✅ RoomMembership creado para ${session.nickname} en sala ${pin}`);
+          }
+        } catch (membershipError) {
+          console.error('⚠️ Error reconectando RoomMembership:', membershipError);
+        }
         
         // cargar todos los mensajes previos con sus archivos
         const previousMessages = await Message.find({ pin }).sort({ timestamp: 1 });
@@ -256,7 +320,7 @@ function RoomController(io) {
         });
 
         console.log(`Usuario ${session.nickname} reagregado despues de reconexion (IP: ${clientIp})`);
-        callback({ success: true, pin });
+        callback({ success: true, pin, roomType: room.roomType });
       } catch (err) {
         console.error('Error en reconnectToRoom:', err);
         callback({ success: false, message: err.message });
@@ -291,9 +355,10 @@ function RoomController(io) {
     });
 
     // enviar archivo
+    // enviar archivo CON ANÁLISIS DE ESTEGANOGRAFÍA
     socket.on('sendFile', async ({ pin, fileData, fileName, fileType, fileSize, tempId }, callback) => {
       try {
-        // validar datos de entrada
+        // ===== 1. VALIDAR DATOS DE ENTRADA =====
         if (!pin || !fileData || !fileName || !fileType || !fileSize) {
           console.log('Datos de archivo incompletos');
           socket.emit('fileError', { message: 'Datos de archivo incompletos', tempId });
@@ -309,7 +374,7 @@ function RoomController(io) {
           return;
         }
         
-        console.log(`Recibiendo archivo: ${fileName} (${fileType}, ${fileSize} bytes) en sala ${pin}`);
+        console.log(`📤 [SOCKET] Recibiendo archivo: ${fileName} (${fileType}, ${fileSize} bytes) en sala ${pin}`);
         
         const room = rooms[pin];
         if (!room) {
@@ -319,11 +384,27 @@ function RoomController(io) {
           return;
         }
 
+        // Validar tipo de sala (multimedia vs text)
+        const roomDocument = await RoomModel.findOne({ pin, isActive: true });
+        if (!roomDocument) {
+          console.log(`🚫 Sala no encontrada en BD para PIN: ${pin}`);
+          socket.emit('fileError', { message: 'Sala no encontrada en base de datos', tempId });
+          if (callback) callback({ success: false, message: 'Sala no encontrada en base de datos' });
+          return;
+        }
+
+        if (roomDocument.roomType === 'text') {
+          console.log(`🚫 Intento de subir archivo a sala de solo texto (PIN: ${pin})`);
+          socket.emit('fileError', { message: 'Esta sala es solo para mensajes de texto. No se permiten archivos multimedia.', tempId });
+          if (callback) callback({ success: false, message: 'Esta sala es solo para mensajes de texto' });
+          return;
+        }
+
         // usar socket.userNickname directamente
         const sender = socket.userNickname || 'Anonimo';
         console.log(`Enviado por: ${sender}`);
 
-        // validar tamano (15MB)
+        // ===== 2. VALIDAR TAMAÑO =====
         const MAX_SIZE = 15 * 1024 * 1024;
         if (fileSize > MAX_SIZE) {
           console.log('Archivo demasiado grande');
@@ -332,14 +413,104 @@ function RoomController(io) {
           return;
         }
 
-        // determinar tipo de mensaje
+        // ===== 3. CONVERTIR BASE64 A BUFFER PARA ANÁLISIS =====
+        let fileBuffer;
+        try {
+          const base64String = fileData.split(',')[1];
+          fileBuffer = Buffer.from(base64String, 'base64');
+          console.log(`✓ Buffer creado: ${fileBuffer.length} bytes`);
+        } catch (error) {
+          console.error('Error al convertir base64 a buffer:', error);
+          socket.emit('fileError', { message: 'Error al procesar el archivo', tempId });
+          if (callback) callback({ success: false, message: 'Error al procesar el archivo' });
+          return;
+        }
+
+        // ===== 4. ANÁLISIS DE SEGURIDAD (ESTEGANOGRAFÍA) =====
+        console.log(`[SECURITY] Analizando archivo para esteganografía: ${fileName}`);
+        
+        const securityValidation = await FileSecurityService.validateFile(
+          fileBuffer,
+          fileType,
+          fileName,
+          {
+            checkSteganography: true,
+            checkIntegrity: true,
+            checkFileType: true,
+            maxSize: 15 * 1024 * 1024
+          }
+        );
+
+        // ===== 5. EVALUAR RESULTADO DEL ANÁLISIS =====
+        if (!securityValidation.isValid) {
+          console.error(`[SECURITY] Archivo rechazado: ${securityValidation.errors.join(', ')}`);
+          
+          // Registrar rechazo en auditoría
+          await AuditService.logFileRejected(
+            null,
+            {
+              fileName,
+              fileSize,
+              fileType,
+              method: 'socket.io'
+            },
+            securityValidation.errors.join(', '),
+            socket.handshake.address
+          );
+
+          socket.emit('fileError', {
+            message: 'Archivo rechazado por razones de seguridad',
+            errors: securityValidation.errors,
+            warnings: securityValidation.warnings,
+            tempId
+          });
+          
+          if (callback) {
+            callback({
+              success: false,
+              message: 'Archivo rechazado por razones de seguridad',
+              errors: securityValidation.errors
+            });
+          }
+          
+          return;
+        }
+
+        // ===== 6. REGISTRAR ADVERTENCIAS (Si hay esteganografía sospechosa) =====
+        if (securityValidation.warnings.length > 0) {
+          console.warn(`[SECURITY] Advertencias detectadas: ${securityValidation.warnings.join(', ')}`);
+          
+          await AuditService.logSteganographyDetected(
+            null,
+            {
+              fileName,
+              fileSize,
+              fileType,
+              method: 'socket.io',
+              reason: securityValidation.warnings.join(', ')
+            },
+            socket.handshake.address
+          );
+
+          // Notificar a admins en tiempo real
+          io.emit('steganography-warning', {
+            fileName,
+            sender,
+            pin,
+            warnings: securityValidation.warnings,
+            confidence: securityValidation.checks.steganography?.confidence || 0,
+            timestamp: new Date()
+          });
+        }
+
+        // ===== 7. DETERMINAR TIPO DE MENSAJE =====
         let messageType = 'document';
         if (fileType.startsWith('image/')) messageType = 'image';
         else if (fileType.startsWith('video/')) messageType = 'video';
         else if (fileType.startsWith('audio/')) messageType = 'audio';
         console.log(`Tipo de mensaje: ${messageType}`);
 
-        // subir a cloudinary con reintentos automaticos
+        // ===== 8. SUBIR A CLOUDINARY =====
         console.log('Subiendo a Cloudinary...');
         const uploadResult = await uploadToCloudinary(fileData, fileName, 'livechat');
 
@@ -350,9 +521,9 @@ function RoomController(io) {
           return;
         }
         
-        console.log('Subido a Cloudinary:', uploadResult.url);
+        console.log('✅ Subido a Cloudinary:', uploadResult.url);
 
-        // crear mensaje en la base de datos
+        // ===== 9. GUARDAR MENSAJE EN BD CON INFO DE SEGURIDAD =====
         console.log('Guardando en base de datos...');
         const message = await Message.create({
           pin,
@@ -367,33 +538,54 @@ function RoomController(io) {
             thumbnail: uploadResult.thumbnail,
             width: uploadResult.width,
             height: uploadResult.height
+          },
+          securityCheck: {
+            steganographyAnalyzed: true,
+            isSuspicious: securityValidation.checks.steganography?.isSuspicious || false,
+            suspiciousReasons: securityValidation.checks.steganography?.reasons || [],
+            analysisTimestamp: new Date()
           }
         });
-        console.log('Mensaje guardado en BD');
+        console.log('✓ Mensaje guardado en BD con info de seguridad');
 
-        // emitir a todos en la sala
+        // ===== 10. EMITIR A TODOS EN LA SALA =====
         console.log(`Emitiendo fileMessage a sala ${pin}`);
         io.to(pin).emit('fileMessage', {
           sender,
           messageType,
           fileData: message.fileData,
           timestamp: message.timestamp,
+          securityCheck: message.securityCheck,
           tempId
         });
         
         // confirmar al emisor que se proceso correctamente
-        socket.emit('fileSuccess', { tempId, success: true });
+        socket.emit('fileSuccess', {
+          tempId,
+          success: true,
+          securityCheck: {
+            analyzed: true,
+            isSafe: !securityValidation.checks.steganography?.isSuspicious
+          }
+        });
         
         // confirmar recepcion al cliente via callback
         if (callback) {
-          callback({ success: true, message: 'Archivo procesado correctamente' });
+          callback({
+            success: true,
+            message: 'Archivo procesado correctamente',
+            securityCheck: {
+              analyzed: true,
+              isSafe: !securityValidation.checks.steganography?.isSuspicious
+            }
+          });
         }
         
-        console.log('Archivo procesado y enviado correctamente');
+        console.log('✅ Archivo procesado y enviado correctamente');
 
       } catch (error) {
-        console.error('Error al procesar archivo:', error);
-        socket.emit('fileError', { message: 'Error al procesar el archivo', tempId });
+        console.error('❌ Error al procesar archivo:', error);
+        socket.emit('fileError', { message: 'Error al procesar el archivo', tempId, error: error.message });
         if (callback) callback({ success: false, message: 'Error al procesar el archivo' });
       }
     });
@@ -406,24 +598,36 @@ function RoomController(io) {
 
     // funcion auxiliar para manejar salas vacias
     const handleEmptyRoom = async (pin) => {
-      const messageCount = await Message.countDocuments({ pin });
-      if (messageCount === 0) {
-        // si no hay mensajes, eliminar la sala
-        await DeviceSession.deleteMany({ roomPin: pin });
-        delete rooms[pin];
-        console.log(`Sala ${pin} eliminada por estar vacia y sin mensajes`);
-      } else {
-        // si hay mensajes, mantener la sala por un tiempo
-        deletionTimers[pin] = setTimeout(async () => {
-          const activeUsers = await DeviceSession.countDocuments({ roomPin: pin });
-          if (activeUsers === 0) {
-            await Message.deleteMany({ pin });
-            await DeviceSession.deleteMany({ roomPin: pin });
-            delete rooms[pin];
-            console.log(`Sala ${pin} eliminada despues del periodo de inactividad`);
-          }
-        }, 3600000);
+      console.log(`📭 Sala ${pin} quedó vacía. Manteniendo mensajes persistentes.`);
+      
+      // Eliminar solo las sesiones de usuarios
+      await DeviceSession.deleteMany({ roomPin: pin });
+      
+      // ✅ ACTUALIZAR PARTICIPANTES EN MONGODB (a 0) pero mantener isActive=true
+      try {
+        const roomDocument = await RoomModel.findOne({ pin: pin });
+        if (roomDocument && roomDocument.isActive) {
+          roomDocument.participantCount = 0;
+          roomDocument.lastActivity = new Date();
+          await roomDocument.save();
+          console.log(`✅ Sala ${pin} actualizada: 0 participantes activos, mensajes conservados.`);
+          
+          // Actualizar pertenencias a desconectado
+          await RoomMembership.updateMany(
+            { roomPin: pin, isConnected: true },
+            { 
+              isConnected: false, 
+              lastSeenAt: new Date() 
+            }
+          );
+        }
+      } catch (dbError) {
+        console.error('⚠️ Error actualizando sala en MongoDB:', dbError);
       }
+      
+      // Eliminar sala de memoria (pero mantener en MongoDB)
+      delete rooms[pin];
+      console.log(`🗂️ Sala ${pin} archivada en memoria. Disponible en BD para reconexión.`);
     };
 
     // marcar salida intencional (no recarga de pagina)
@@ -456,18 +660,46 @@ function RoomController(io) {
       room.removeUser(socket.id);
       socket.leave(pin);
 
+      // ✅ DECREMENTAR PARTICIPANTES EN MONGODB
       try {
-        // verificar sesion antes de eliminar
-        const sessionBefore = await DeviceSession.findOne({ ip: clientIp, roomPin: pin });
-        console.log(`Sesion encontrada antes de eliminar:`, sessionBefore ? 'SI' : 'NO');
+        const roomDocument = await RoomModel.findOne({ pin: pin });
+        if (roomDocument) {
+          await roomDocument.decrementParticipants();
+          console.log(`✅ Participante removido. Quedan ${roomDocument.participantCount} en BD`);
+        }
+      } catch (dbError) {
+        console.error('⚠️ Error decrementando participantes en MongoDB:', dbError);
+      }
+
+      try {
+        // 🔒 VERIFICAR Y ELIMINAR SESIÓN POR IP COMPLETAMENTE
+        console.log(`🔍 Buscando sesión para eliminar: IP=${clientIp}, PIN=${pin}`);
         
-        // eliminar sesion por ip
-        const result = await removeSession(deviceId, clientIp, pin);
-        console.log(`Sesion eliminada completamente para ${nickname} (IP: ${clientIp}) de sala ${pin}`);
+        const sessionBefore = await DeviceSession.findOne({ ip: clientIp });
+        console.log(`📋 Sesión antes de eliminar:`, sessionBefore ? `Existe (sala: ${sessionBefore.roomPin})` : 'No existe');
         
-        // verificar que se elimino
-        const sessionAfter = await DeviceSession.findOne({ ip: clientIp, roomPin: pin });
-        console.log(`Sesion despues de eliminar:`, sessionAfter ? 'TODAVIA EXISTE' : 'ELIMINADA');
+        // 🔒 ELIMINAR TODAS las sesiones de esta IP (pueden ser múltiples por diferentes navegadores)
+        const result = await DeviceSession.deleteMany({ ip: clientIp });
+        console.log(`🗑️ Sesiones eliminadas para IP ${clientIp} - Documentos eliminados: ${result.deletedCount}`);
+        
+        // Verificar que se eliminaron todas
+        const remainingSessions = await DeviceSession.find({ ip: clientIp });
+        console.log(`📋 Sesiones restantes después de eliminar:`, remainingSessions.length);
+        
+        if (remainingSessions.length > 0) {
+          console.error(`⚠️ ERROR: Todavía quedan ${remainingSessions.length} sesiones para IP ${clientIp}`);
+          remainingSessions.forEach(s => console.log(`  - ${s.roomPin}: ${s.deviceId}`));
+        } else {
+          console.log(`✅ TODAS las sesiones eliminadas correctamente para IP ${clientIp}`);
+        }
+        
+        // ✅ DESCONECTAR DE LA SALA (pero mantener pertenencia por si vuelve)
+        const membership = await RoomMembership.findOne({ ip: clientIp, roomPin: pin });
+        if (membership) {
+          await membership.disconnect();
+          console.log(`${nickname} DESCONECTADO de sala ${pin} (pertenencia mantenida)`);
+        }
+        
       } catch (err) {
         console.error(`Error eliminando sesion:`, err);
       }
