@@ -1,74 +1,68 @@
 version: '3.8'
 
 services:
-  # MongoDB Database
-  mongodb:
-    image: mongo:latest
-    container_name: livechat-mongodb
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-    networks:
-      - livechat-network
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Backend Server
-  server:
+  livechat-ec:
     build:
-      context: ./server
+      context: .
       dockerfile: Dockerfile
-    container_name: livechat-server
-    restart: unless-stopped
-    ports:
-      - "3001:3001"
-    environment:
-      - MONGODB_URI=mongodb://mongodb:27017/livechat
-      - PORT=3001
-      - FRONTEND_URL=http://localhost:80
-      - NODE_ENV=production
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    networks:
-      - livechat-network
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/get-ip"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-
-  # Frontend Client
-  client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-      args:
-        - REACT_APP_SOCKET_URL=http://localhost:3001
-    container_name: livechat-client
-    restart: unless-stopped
+    container_name: livechat-ec
     ports:
       - "80:80"
-    depends_on:
-      server:
-        condition: service_healthy
+    environment:
+      # Node.js Configuration
+      - NODE_ENV=production
+      - PORT=3001
+      
+      # MongoDB Database (MongoDB Atlas)
+      - MONGODB_URI=mongodb+srv://jimarin:jimarin@cluster0.uhxeukq.mongodb.net/livechat?retryWrites=true&w=majority&appName=Cluster0
+      
+      # JWT & Authentication
+      - JWT_SECRET=326d52214618fc382eb43219407305af84d63764ceed04edbfd2c64f2166de7559181739fdfec8ce29954f289bef1069535c7c47157d345991bd2f77d7460f15
+      
+      # Cloudinary Storage
+      - CLOUDINARY_CLOUD_NAME=dajew4tih
+      - CLOUDINARY_API_KEY=288784234818757
+      - CLOUDINARY_API_SECRET=zGLdboy5Il3Ib0KUjB9IxmjqWmY
+      - CLOUDINARY_URL=cloudinary://288784234818757:zGLdboy5Il3Ib0KUjB9IxmjqWmY@dajew4tih
+      
+      # Encryption & Security
+      - ENCRYPTION_MASTER_KEY=68c063c9a6c13ed36b7df4af9ef159e68b7890b55cc84adba2a2b2479a316319
+      - INTEGRITY_KEY=6fc266700e8964405cee16fb1e118fb33f67981274ae593021eb1e7bfa18c3e8
+      - SESSION_SECRET=6fc266700e8964405cee16fb1e118fb33f67981274ae593021eb1e7bfa18c3e8
+      
+      # Frontend Configuration (actualizar con tu dominio de Cloudflare)
+      - FRONTEND_URL=https://chat.livechatec.online
+      
+      # SSL Configuration
+      - ENABLE_SSL=false
+      
+      # Rate Limiting
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+      
+      # Worker Thread Pool
+      - MIN_WORKERS=2
+      - MAX_WORKERS=8
+      
+      # File Security
+      - MAX_FILE_SIZE=15728640
+      - ENABLE_STEGANOGRAPHY_CHECK=true
+      - STEGANOGRAPHY_CONFIDENCE_THRESHOLD=0.7
+      
+      # Logging
+      - LOG_LEVEL=info
+      - LOG_TO_MONGODB=true
+      
+      # Cleanup Configuration
+      - CLEAN_DAYS_OLD=7
+      
+      # Allowed MIME Types
+      - ALLOWED_MIME_TYPES=image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,audio/mpeg,audio/mp3,audio/wav,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/zip
+      
+    restart: unless-stopped
     networks:
       - livechat-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
 
 networks:
   livechat-network:
     driver: bridge
-
-volumes:
-  mongodb_data:
-    driver: local
