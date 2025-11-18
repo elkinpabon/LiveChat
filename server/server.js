@@ -43,7 +43,6 @@ const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const adminRoomsRoutes = require('./routes/adminRooms');
 const roomRoutes = require('./routes/rooms');
-const myRoomsRoutes = require('./routes/myRooms');
 
 const app = express();
 
@@ -131,11 +130,11 @@ app.set('io', io);
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('✓ MongoDB conectado exitosamente');
-    logger.info('MongoDB connected successfully');
+    LoggerService.info('MongoDB connected successfully');
   })
   .catch(err => {
     console.error('✗ Error conectando a MongoDB:', err);
-    logger.error('MongoDB connection error', { error: err.message });
+    LoggerService.error('MongoDB connection error', { error: err.message });
     process.exit(1);
   });
 
@@ -148,12 +147,12 @@ const globalThreadPool = new ThreadPoolManager({
 });
 
 // Monitorear eventos del pool
-globalThreadPool.on('task-completed', (data) => {
-  logger.info('Task completed', data);
+globalThreadPool.on('taskCompleted', (data) => {
+  LoggerService.info('Task completed', data);
 });
 
-globalThreadPool.on('task-failed', (data) => {
-  logger.error('Task failed', data);
+globalThreadPool.on('taskFailed', (data) => {
+  LoggerService.error('Task failed', data);
 });
 
 globalThreadPool.on('scaled-up', (data) => {
@@ -172,15 +171,12 @@ app.use('/api/auth', authRoutes);
 // ⚠️ IMPORTANTE: Las rutas más específicas DEBEN ir primero
 // Rutas de salas de administración (ANTES de /api/admin genérico)
 app.use('/api/admin/rooms', adminRoomsRoutes);
-
 // Rutas de administración genérica
 app.use('/api/admin', adminRoutes);
-
 // Rutas públicas de salas
 app.use('/api/rooms', roomRoutes);
 
-// Rutas de mis salas (pertenencias de usuario)
-app.use('/api/my-rooms', myRoomsRoutes);
+
 
 // ==================== ENDPOINT DE UPLOAD CON SEGURIDAD ====================
 
@@ -210,15 +206,12 @@ app.post('/api/upload',
       }
 
       if (roomDocument.roomType === 'text') {
-        console.log(`🚫 Intento de subir archivo a sala de solo texto (PIN: ${pin})`);
+        console.log(`Intento de subir archivo a sala de solo texto (PIN: ${pin})`);
         return res.status(403).json({
           success: false,
           message: 'Esta sala es solo para mensajes de texto. No se permiten archivos multimedia.'
         });
       }
-
-      console.log(`📤 HTTP Upload: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
-
       // ===== ANÁLISIS DE SEGURIDAD DEL ARCHIVO =====
       console.log(`[SECURITY] Analyzing file: ${file.originalname}`);
       
@@ -230,7 +223,7 @@ app.post('/api/upload',
           checkSteganography: true,
           checkIntegrity: true,
           checkFileType: true,
-          maxSize: 15 * 1024 * 1024
+          maxSize: 25 * 1024 * 1024
         }
       );
 
@@ -261,7 +254,7 @@ app.post('/api/upload',
       if (securityValidation.warnings.length > 0 || 
           securityValidation.checks.steganography?.isSuspicious) {
         
-        console.warn(`[SECURITY] 🚨 Archivo sospechoso RECHAZADO: ${file.originalname}`);
+        console.warn(`[SECURITY] Archivo sospechoso RECHAZADO: ${file.originalname}`);
         console.warn(`[SECURITY] Razones: ${securityValidation.warnings.join(', ')}`);
         
         const reasons = securityValidation.checks.steganography?.reasons || securityValidation.warnings;
@@ -291,7 +284,7 @@ app.post('/api/upload',
         );
 
         // Emitir notificación WebSocket a todos los administradores conectados
-        console.warn(`[ADMIN-ALERT] 🚨 Notificando a administradores sobre archivo sospechoso rechazado`);
+        console.warn(`[ADMIN-ALERT] Notificando a administradores sobre archivo sospechoso rechazado`);
         io.emit('adminAlert:suspiciousFileRejected', {
           timestamp: new Date(),
           fileName: file.originalname,
@@ -383,7 +376,7 @@ app.post('/api/upload',
         tempId
       });
 
-      console.log(`✅ HTTP Upload exitoso: ${uploadResult.url}`);
+      console.log(`HTTP Upload exitoso: ${uploadResult.url}`);
       
       res.json({ 
         success: true, 
@@ -397,8 +390,8 @@ app.post('/api/upload',
       });
 
     } catch (error) {
-      console.error('❌ Error en HTTP upload:', error);
-      logger.error('File upload error', { error: error.message });
+      console.error('Error en HTTP upload:', error);
+      LoggerService.error('File upload error', { error: error.message });
       res.status(500).json({ 
         success: false, 
         message: error.message 
@@ -409,7 +402,7 @@ app.post('/api/upload',
 
 // ==================== CONTROLADOR DE SALAS CON SOCKETS ====================
 
-RoomController(io);
+const roomControllerExports = RoomController(io);
 
 // ==================== ENDPOINT ADICIONALES ====================
 
@@ -476,7 +469,7 @@ app.use((req, res) => {
 // Error handler global
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err);
-  logger.error('Unhandled error', {
+  LoggerService.error('Unhandled error', {
     error: err.message,
     stack: err.stack,
     path: req.path,
@@ -527,10 +520,10 @@ server.listen(PORT, () => {
   console.log('  • Auto-scaling Workers');
   console.log('  • Lock Management (deadlock prevention)');
   console.log('');
-  console.log(`📊 Thread Pool Stats:`, globalThreadPool.getStats());
+  console.log(` Thread Pool Stats:`, globalThreadPool.getStats());
   console.log('');
   
-  logger.info('Server started', {
+  LoggerService.info('Server started', {
     port: PORT,
     environment: process.env.NODE_ENV || 'development'
   });
@@ -557,12 +550,21 @@ async function gracefulShutdown(signal) {
   } catch (error) {
     console.error('Error closing thread pools:', error);
   }
-  
+  // Detener controladores/servicios que usan MongoDB (evitar queries durante cierre)
+  try {
+    if (roomControllerExports && typeof roomControllerExports.stop === 'function') {
+      roomControllerExports.stop();
+      console.log('✓ RoomController stopped services');
+    }
+  } catch (err) {
+    console.error('Error stopping room controller services:', err);
+  }
+
   // Cerrar conexión a MongoDB
   await mongoose.connection.close();
-  console.log('✓ MongoDB connection closed');
+  console.log('MongoDB connection closed');
   
-  logger.info('Server shutdown complete');
+  LoggerService.info('Server shutdown complete');
   process.exit(0);
 }
 
@@ -572,13 +574,13 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Capturar excepciones no manejadas
 process.on('uncaughtException', (error) => {
-  console.error('💥 Uncaught Exception:', error);
+  console.error(' Uncaught Exception:', error);
   LoggerService.error('Uncaught exception', { error: error.message, stack: error.stack });
   gracefulShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
   LoggerService.error('Unhandled rejection', { reason });
   gracefulShutdown('unhandledRejection');
 });

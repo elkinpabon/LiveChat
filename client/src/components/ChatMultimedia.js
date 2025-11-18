@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import socket from '../services/socketService';
 import { Send, Users, MessageCircle, Paperclip, X, Image as ImageIcon, Video as VideoIcon, Music as MusicIcon, FileText } from 'lucide-react';
+import ParticipantsList from './ParticipantsList';
 
 // PrimeReact CSS PRIMERO
 import 'primereact/resources/themes/lara-light-indigo/theme.css';
@@ -13,7 +14,8 @@ import '../styles/ChatRoom.css';
 
 import { getDeviceId, clearCurrentRoom, updateRoomActivity,isReconnecting,finishReconnection,markPageRefreshing } from '../utils/deviceManager';
 import { confirmDialog, ConfirmDialog } from 'primereact/confirmdialog';
-import { Toast } from 'primereact/toast'; 
+import { Toast } from 'primereact/toast';
+import { Dialog } from 'primereact/dialog'; 
 
 const ChatMultimedia = ({ pin, nickname, onLeave }) => {
   const [message, setMessage] = useState('');
@@ -27,16 +29,54 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
   const [errorModal, setErrorModal] = useState({ isOpen: false, message: '' });
   const [downloadModal, setDownloadModal] = useState({ isOpen: false, url: null, fileName: null });
   const [uploadProgress, setUploadProgress] = useState({ show: false, message: '', percent: 0 });
+  const [participantsList, setParticipantsList] = useState([]);
+  const [totalParticipants, setTotalParticipants] = useState(0);
+  const [maxParticipants, setMaxParticipants] = useState(0);
+  const [isPanelVisible, setIsPanelVisible] = useState(true);
+  const [steganographyModal, setSteganographyModal] = useState({ 
+    isOpen: false, 
+    fileName: '', 
+    reasons: [], 
+    confidence: 0,
+    criticalReasons: [],
+    warningReasons: [],
+    infoReasons: []
+  });
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const toast = useRef(null);
+  const activityIntervalRef = useRef(null);
   
   useEffect(() => {
     // Configurar intervalos para actualizar la actividad del usuario
-    const activityInterval = setInterval(() => {
+    activityIntervalRef.current = setInterval(() => {
       updateRoomActivity();
+      // Enviar heartbeat al servidor
+      socket.emit('userActivity', { pin, deviceId: getDeviceId() });
     }, 30000); // Cada 30 segundos
+    
+    // 🔧 LISTENER DE MENSAJES PREVIOS - Debe estar ANTES de solicitar los mensajes
+    const handlePreviousMessages = (messages) => {
+      console.log('📜 Mensajes previos recibidos:', messages.length);
+      const formattedMessages = messages.map(msg => ({
+        sender: msg.sender,
+        text: msg.text,
+        messageType: msg.messageType || 'text',
+        fileData: msg.fileData,
+        timestamp: new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }));
+      
+      // Restaurar mensajes sin borrar los temporales que están subiendo
+      setMessages(prev => {
+        // Mantener solo mensajes temporales que estén subiendo activamente
+        const uploadingTemp = prev.filter(m => m.isTemp && m.fileData?.uploading);
+        // Agregar mensajes del servidor
+        return [...formattedMessages, ...uploadingTemp];
+      });
+    };
+    
+    socket.on('previousMessages', handlePreviousMessages);
     
     // Escuchar cuando el admin cierra la sala
     socket.on('roomClosedByAdmin', ({ message: msg }) => {
@@ -52,6 +92,78 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
         clearCurrentRoom();
         onLeave();
       }, 5000);
+    });
+
+    // 🆕 Escuchar actualizaciones de la lista de usuarios
+    socket.on('userListUpdate', ({ users, totalCount, maxParticipants: max }) => {
+      console.log('📋 Lista de usuarios actualizada:', users);
+      setParticipantsList(users);
+      setTotalParticipants(totalCount);
+      setMaxParticipants(max);
+    });
+
+    // Solicitar lista de usuarios al montar el componente
+    socket.emit('requestUserList', { pin });
+
+    // 🆕 Escuchar advertencia de inactividad
+    socket.on('inactivityWarning', ({ message: msg, secondsRemaining, reason }) => {
+      if (reason === 'INACTIVITY_WARNING') {
+        // Mostrar diálogo de confirmación con cuenta regresiva
+        let countdown = secondsRemaining;
+        
+        const updateDialogMessage = () => {
+          const messageElement = document.querySelector('.p-dialog-content p');
+          if (messageElement) {
+            messageElement.textContent = `${msg}\n\nSerás desconectado en ${countdown} segundos por inactividad.\n\n¿Deseas permanecer en la sala?`;
+          }
+        };
+        
+        const countdownInterval = setInterval(() => {
+          countdown--;
+          updateDialogMessage();
+          
+          if (countdown <= 0) {
+            clearInterval(countdownInterval);
+          }
+        }, 1000);
+        
+        confirmDialog({
+          message: `${msg}\n\nSerás desconectado en ${countdown} segundos por inactividad.\n\n¿Deseas permanecer en la sala?`,
+          header: '⚠️ Advertencia de Inactividad',
+          icon: 'pi pi-exclamation-triangle',
+          acceptLabel: 'Sí, permanecer',
+          rejectLabel: 'Salir ahora',
+          accept: () => {
+            // Usuario responde - enviar actividad
+            clearInterval(countdownInterval);
+            socket.emit('userActivity', { pin, deviceId: getDeviceId() });
+            updateRoomActivity();
+            console.log('✅ Usuario respondió - actividad actualizada');
+          },
+          reject: () => {
+            // Usuario decide salir
+            clearInterval(countdownInterval);
+            clearCurrentRoom();
+            onLeave();
+          },
+          onHide: () => {
+            clearInterval(countdownInterval);
+          }
+        });
+      } else if (reason === 'INACTIVITY_TIMEOUT') {
+        // Desconexión definitiva
+        toast.current?.show({
+          severity: 'error',
+          summary: 'Desconectado',
+          detail: msg,
+          life: 3000
+        });
+        
+        setTimeout(() => {
+          clearCurrentRoom();
+          onLeave();
+        }, 3000);
+      }
     });
     
     socket.on('chatMessage', ({ sender, text }) => {
@@ -107,28 +219,56 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
       }, 1500);
     });
 
-    socket.on('fileError', ({ message: errorMsg, tempId }) => {
+    socket.on('fileError', ({ message: errorMsg, tempId, isSuspicious, reasons, confidence, fileName }) => {
       console.error('❌ Error de archivo:', errorMsg);
       
-      // Mensajes de error más amigables
-      let userMessage = errorMsg;
-      if (errorMsg.includes('15MB')) {
-        userMessage = 'El archivo es demasiado grande. Máximo 15MB.';
-      } else if (errorMsg.includes('Cloudinary')) {
-        userMessage = 'Error al subir el archivo. Por favor intenta de nuevo.';
-      } else if (errorMsg.includes('no existe')) {
-        userMessage = 'La sala ya no existe. Por favor actualiza la página.';
-      } else if (errorMsg.includes('base64') || errorMsg.includes('formato')) {
-        userMessage = 'Formato de archivo no válido. Por favor intenta con otro archivo.';
+      // Caso especial: Archivo sospechoso con esteganografía
+      if (isSuspicious && reasons) {
+        // Categorizar motivos por severidad (sin emojis)
+        const criticalReasons = reasons.filter(r => r.includes('CRÍTICO') || r.includes('ALTA SOSPECHA'));
+        const warningReasons = reasons.filter(r => !r.includes('CRÍTICO') && !r.includes('ALTA SOSPECHA') && !r.includes('Metadatos'));
+        const infoReasons = reasons.filter(r => r.includes('Metadatos'));
+        
+        // Mostrar modal de esteganografía
+        setSteganographyModal({
+          isOpen: true,
+          fileName: fileName || 'archivo',
+          reasons,
+          confidence: confidence || 0,
+          criticalReasons,
+          warningReasons,
+          infoReasons
+        });
+      } else {
+        // Mensajes de error normales más amigables
+        let userMessage = errorMsg;
+        if (errorMsg.includes('25MB')) {
+          userMessage = 'El archivo es demasiado grande. Máximo 25MB.';
+        } else if (errorMsg.includes('Cloudinary')) {
+          userMessage = 'Error al subir el archivo. Por favor intenta de nuevo.';
+        } else if (errorMsg.includes('no existe')) {
+          userMessage = 'La sala ya no existe. Por favor actualiza la página.';
+        } else if (errorMsg.includes('base64') || errorMsg.includes('formato')) {
+          userMessage = 'Formato de archivo no válido. Por favor intenta con otro archivo.';
+        } else if (errorMsg.includes('seguridad') || errorMsg.includes('rechazado')) {
+          userMessage = '⚠️ Archivo rechazado por razones de seguridad.';
+        }
+        
+        setErrorModal({ isOpen: true, message: userMessage });
       }
       
-      setErrorModal({ isOpen: true, message: userMessage });
       setUploadingFile(false);
       setUploadProgress({ show: false, message: '', percent: 0 });
       
       // Eliminar mensaje temporal si hay error
       if (tempId) {
         setMessages(prev => prev.filter(m => m.id !== tempId));
+      }
+      
+      // Limpiar archivo seleccionado
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
       }
     });
 
@@ -144,29 +284,24 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
       setIsLastUser(count === 1);
     });
 
+    // ✅ NUEVO: Escuchar actualización de participantes en tiempo real
+    socket.on('participantCountUpdate', ({ count, limit: roomLimit, isLastUser: isLast }) => {
+      console.log(`👥 Actualización de participantes: ${count}/${roomLimit}`);
+      setParticipants(count);
+      setLimit(roomLimit);
+      setIsLastUser(isLast);
+    });
+
     socket.on('isLastUser', (isLast) => {
       setIsLastUser(isLast);
     });
 
-    // Manejar mensajes previos
-    socket.on('previousMessages', (messages) => {
-      console.log('📜 Mensajes previos recibidos:', messages.length);
-      const formattedMessages = messages.map(msg => ({
-        sender: msg.sender,
-        text: msg.text,
-        messageType: msg.messageType || 'text',
-        fileData: msg.fileData,
-        timestamp: new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }));
-      
-      // Restaurar mensajes sin borrar los temporales que están subiendo
-      setMessages(prev => {
-        // Mantener solo mensajes temporales que estén subiendo activamente
-        const uploadingTemp = prev.filter(m => m.isTemp && m.fileData?.uploading);
-        // Agregar mensajes del servidor
-        return [...formattedMessages, ...uploadingTemp];
-      });
-    });
+    // 🔧 Solicitar mensajes previos DESPUÉS de configurar el listener
+    console.log(`📤 Solicitando mensajes previos para sala ${pin}`);
+    socket.emit('requestPreviousMessages', { pin });
+    
+    // ✅ Enviar actividad inicial al montar el componente
+    socket.emit('userActivity', { pin, deviceId: getDeviceId() });
 
     return () => {
       socket.off('chatMessage');
@@ -175,11 +310,17 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
       socket.off('fileError');
       socket.off('userJoined');
       socket.off('userLeft');
+      socket.off('participantCountUpdate');
       socket.off('isLastUser');
-      socket.off('previousMessages');
-      clearInterval(activityInterval);
+      socket.off('previousMessages', handlePreviousMessages);
+      socket.off('userListUpdate');
+      socket.off('inactivityWarning');
+      socket.off('roomClosedByAdmin');
+      if (activityIntervalRef.current) {
+        clearInterval(activityIntervalRef.current);
+      }
     };
-  }, [pin]);
+  }, [pin, nickname]);
 
   useEffect(() => {
     // Verificar si estamos reconectando desde un refresh
@@ -192,17 +333,13 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
           deviceId: getDeviceId() 
         }, (response) => {
           if (response && response.success) {
-            console.log('Reconexión exitosa');
-            // Solicitar mensajes previos por si no se cargaron
-            socket.emit('requestPreviousMessages', { pin });
+            console.log('✅ Reconexión exitosa');
+            // Enviar actividad inmediatamente
+            socket.emit('userActivity', { pin, deviceId: getDeviceId() });
           } else {
-            console.error('Error en reconexión:', response?.message || 'Sin respuesta del servidor');
-            // Si falla la reconexión, intentar unirse nuevamente
-            socket.emit('joinRoom', { pin, nickname, deviceId: getDeviceId() }, (joinResponse) => {
-              if (joinResponse && joinResponse.success) {
-                console.log('Reingreso exitoso a la sala');
-              }
-            });
+            console.error('❌ Error en reconexión:', response?.message || 'Sin respuesta');
+            // Si falla la reconexión, el usuario ya está en la sala (joinRoom se encargó)
+            // Solo marcamos la reconexión como finalizada
           }
           // Marcar reconexión como finalizada
           finishReconnection();
@@ -245,12 +382,12 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
 
     console.log('📎 Archivo seleccionado:', file.name, 'Tamaño:', (file.size / (1024 * 1024)).toFixed(2), 'MB', 'Tipo:', file.type);
 
-    // Validar tamaño (15MB)
-    const MAX_SIZE = 15 * 1024 * 1024;
+    // Validar tamaño (25MB)
+    const MAX_SIZE = 25 * 1024 * 1024;
     if (file.size > MAX_SIZE) {
       setErrorModal({ 
         isOpen: true, 
-        message: `El archivo "${file.name}" supera el límite de 15MB. Tamaño actual: ${(file.size / (1024 * 1024)).toFixed(2)}MB` 
+        message: `El archivo "${file.name}" supera el límite de 25MB. Tamaño actual: ${(file.size / (1024 * 1024)).toFixed(2)}MB` 
       });
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
@@ -362,31 +499,25 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
           const response = JSON.parse(xhr.responseText);
           console.error('🚨 Archivo sospechoso rechazado:', response);
           
-          const reasonsText = response.reasons ? response.reasons.join(', ') : 'Contenido sospechoso detectado';
-          const confidenceText = response.confidence ? `${response.confidence}%` : 'alto';
+          const reasons = response.reasons || [];
+          const fileName = response.fileName || file.name;
+          const confidence = response.confidence || 0;
           
-          if (toast.current) {
-            toast.current.show({
-              severity: 'error',
-              summary: '🚫 Archivo Rechazado - Contenido Sospechoso',
-              detail: `El archivo "${response.fileName || file.name}" ha sido RECHAZADO por razones de seguridad.\n\nMotivos detectados:\n${reasonsText}\n\nNivel de confianza: ${confidenceText}\n\n⚠️ Este archivo podría contener esteganografía u otro contenido oculto. Por su seguridad, no se permite subirlo.`,
-              sticky: true,
-              closable: true,
-              life: 20000,
-              style: { 
-                maxWidth: '550px',
-                backgroundColor: '#fee2e2',
-                borderLeft: '5px solid #dc2626',
-                color: '#7f1d1d'
-              }
-            });
-          } else {
-            // Fallback si el toast no está disponible
-            setErrorModal({ 
-              isOpen: true, 
-              message: `Archivo rechazado por seguridad: ${reasonsText}` 
-            });
-          }
+          // Categorizar motivos por severidad (sin emojis)
+          const criticalReasons = reasons.filter(r => r.includes('CRÍTICO') || r.includes('ALTA SOSPECHA'));
+          const warningReasons = reasons.filter(r => !r.includes('CRÍTICO') && !r.includes('ALTA SOSPECHA') && !r.includes('Metadatos'));
+          const infoReasons = reasons.filter(r => r.includes('Metadatos'));
+          
+          // Mostrar modal de esteganografía
+          setSteganographyModal({
+            isOpen: true,
+            fileName,
+            reasons,
+            confidence,
+            criticalReasons,
+            warningReasons,
+            infoReasons
+          });
           
           setUploadingFile(false);
           setUploadProgress({ show: false, message: '', percent: 0 });
@@ -519,7 +650,13 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
         
         if (!response || !response.success) {
           console.error('❌ Error confirmado por servidor:', response);
-          setErrorModal({ isOpen: true, message: response?.message || 'Error al procesar el archivo' });
+          
+          // Si es archivo sospechoso, el evento fileError por socket ya mostró el modal
+          // No mostrar el modal genérico de error
+          if (!response?.isSuspicious) {
+            setErrorModal({ isOpen: true, message: response?.message || 'Error al procesar el archivo' });
+          }
+          
           setUploadingFile(false);
           setUploadProgress({ show: false, message: '', percent: 0 });
           setMessages(prev => prev.filter(m => m.id !== tempId));
@@ -628,7 +765,12 @@ const ChatMultimedia = ({ pin, nickname, onLeave }) => {
               clearTimeout(uploadTimeout);
               if (!response || !response.success) {
                 console.error('❌ Error confirmado por servidor');
-                setErrorModal({ isOpen: true, message: response?.message || 'Error al procesar el archivo' });
+                
+                // Si es archivo sospechoso, el evento fileError por socket ya mostró el modal
+                if (!response?.isSuspicious) {
+                  setErrorModal({ isOpen: true, message: response?.message || 'Error al procesar el archivo' });
+                }
+                
                 setUploadingFile(false);
                 setMessages(prev => prev.filter(m => m.id !== tempId));
               }
@@ -890,91 +1032,105 @@ const confirmExit = async () => {
     <div className="chat-wrapper">
       <Toast ref={toast} position="top-right" />
       <ConfirmDialog />
-      <header className="chat-topbar">
-        <div className="room-info">
-          <MessageCircle size={20} />
-          <span>Sala <strong>{pin}</strong> - {nickname}</span>
-          <span className="multimedia-badge-small">
-            <Paperclip size={12} />
-            Multimedia
-          </span>
-        </div>
-        <div className="topbar-actions">
-          <div className="user-count">
-            <Users size={18} /> {participants} {limit ? `/ ${limit}` : ''}
-            {isLastUser && <span className="last-user-badge"> (Último usuario)</span>}
-          </div>
-          <div className="room-buttons">
-            <button className="exit-btn" onClick={confirmExit} title="Salir de la sala">
-              <X size={16} />
-              <span>Salir</span>
-            </button>
-          </div>
-        </div>
-      </header>
       
-      {/* Indicador de sala multimedia */}
-      <div className="multimedia-info">
-        <Paperclip size={16} />
-        <span>Sala Multimedia - Puedes enviar imágenes, videos, audio y documentos</span>
-      </div>
-
-      <div className="chat-messages">
-        {messages.map((msg, idx) => renderMessage(msg, idx))}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {selectedFile && (
-        <div className="file-preview">
-          <div className="file-preview-content">
-            <span className="file-preview-name">
-              {selectedFile.type.startsWith('image/') && <ImageIcon size={16} />}
-              {selectedFile.type.startsWith('video/') && <VideoIcon size={16} />}
-              {selectedFile.type.startsWith('audio/') && <MusicIcon size={16} />}
-              {!selectedFile.type.startsWith('image/') && 
-               !selectedFile.type.startsWith('video/') && 
-               !selectedFile.type.startsWith('audio/') && <FileText size={16} />}
-              {selectedFile.name}
-            </span>
-            <button onClick={cancelFile} className="cancel-file-btn">
-              <X size={16} />
-            </button>
-          </div>
-          <button onClick={sendFile} disabled={uploadingFile} className="send-file-btn">
-            {uploadingFile ? 'Subiendo...' : 'Enviar archivo'}
-          </button>
-        </div>
-      )}
-
-      <footer className="chat-input-bar">
-        <input
-          type="file"
-          ref={fileInputRef}
-          onChange={handleFileSelect}
-          style={{ display: 'none' }}
-          accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.7z,.gz"
+      <div className="chat-container-with-participants">
+        {/* Panel de participantes */}
+        <ParticipantsList 
+          participants={participantsList}
+          totalCount={totalParticipants}
+          maxParticipants={maxParticipants}
+          onVisibilityChange={setIsPanelVisible}
         />
-        <button 
-          onClick={() => fileInputRef.current?.click()} 
-          className="attach-btn"
-          title="Adjuntar archivo: imágenes, videos, audio, documentos, comprimidos (máx 15MB) - Imágenes se comprimen automáticamente"
-        >
-          <Paperclip size={20} />
-        </button>
-        <div className="chat-input-container">
-          <input
-            type="text"
-            placeholder="Escribe un mensaje multimedia..."
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-          />
+        
+        {/* Contenedor principal del chat */}
+        <div className={`chat-main-area ${!isPanelVisible ? 'panel-hidden' : ''}`}>
+          <header className="chat-topbar">
+            <div className="room-info">
+              <MessageCircle size={20} />
+              <span>Sala <strong>{pin}</strong> - {nickname}</span>
+              <span className="multimedia-badge-small">
+                <Paperclip size={12} />
+                Multimedia
+              </span>
+            </div>
+            <div className="topbar-actions">
+              <div className="user-count">
+                <Users size={18} /> {participants} {limit ? `/ ${limit}` : ''}
+                {isLastUser && <span className="last-user-badge"> (Último usuario)</span>}
+              </div>
+              <div className="room-buttons">
+                <button className="exit-btn" onClick={confirmExit} title="Salir de la sala">
+                  <X size={16} />
+                  <span>Salir</span>
+                </button>
+              </div>
+            </div>
+          </header>
+      
+          {/* Indicador de sala multimedia */}
+          <div className="multimedia-info">
+            <Paperclip size={16} />
+            <span>Sala Multimedia - Puedes enviar imágenes, videos, audio y documentos</span>
+          </div>
+
+          <div className="chat-messages">
+            {messages.map((msg, idx) => renderMessage(msg, idx))}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {selectedFile && (
+            <div className="file-preview">
+              <div className="file-preview-content">
+                <span className="file-preview-name">
+                  {selectedFile.type.startsWith('image/') && <ImageIcon size={16} />}
+                  {selectedFile.type.startsWith('video/') && <VideoIcon size={16} />}
+                  {selectedFile.type.startsWith('audio/') && <MusicIcon size={16} />}
+                  {!selectedFile.type.startsWith('image/') && 
+                   !selectedFile.type.startsWith('video/') && 
+                   !selectedFile.type.startsWith('audio/') && <FileText size={16} />}
+                  {selectedFile.name}
+                </span>
+                <button onClick={cancelFile} className="cancel-file-btn">
+                  <X size={16} />
+                </button>
+              </div>
+              <button onClick={sendFile} disabled={uploadingFile} className="send-file-btn">
+                {uploadingFile ? 'Subiendo...' : 'Enviar archivo'}
+              </button>
+            </div>
+          )}
+
+          <footer className="chat-input-bar">
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileSelect}
+              style={{ display: 'none' }}
+              accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.7z,.gz"
+            />
+            <button 
+              onClick={() => fileInputRef.current?.click()} 
+              className="attach-btn"
+              title="Adjuntar archivo: imágenes, videos, audio, documentos, comprimidos (máx 15MB) - Imágenes se comprimen automáticamente"
+            >
+              <Paperclip size={20} />
+            </button>
+            <div className="chat-input-container">
+              <input
+                type="text"
+                placeholder="Escribe un mensaje multimedia..."
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+              />
+            </div>
+            <button onClick={sendMessage} className="send-btn" disabled={!message.trim() && !selectedFile}>
+              <Send size={20} />
+              <span>Enviar</span>
+            </button>
+          </footer>
         </div>
-        <button onClick={sendMessage} className="send-btn" disabled={!message.trim() && !selectedFile}>
-          <Send size={20} />
-          <span>Enviar</span>
-        </button>
-      </footer>
+      </div>
 
       {/* Modal para ampliar imágenes y videos */}
       {mediaModal.isOpen && (
@@ -1057,7 +1213,97 @@ const confirmExit = async () => {
         </div>
       )}
 
-      <ConfirmDialog />
+      {/* Modal de Esteganografía Detectada */}
+      <Dialog 
+        visible={steganographyModal.isOpen} 
+        onHide={() => setSteganographyModal({ ...steganographyModal, isOpen: false })}
+        header={
+          <div style={{ textAlign: 'center', width: '100%', padding: '16px 0' }}>
+            <i className="pi pi-ban" style={{ fontSize: '32px', color: '#dc2626' }}></i>
+            <span style={{ display: 'block', marginTop: '16px', fontSize: '19px', fontWeight: '700', color: '#1f2937' }}>Archivo Bloqueado</span>
+          </div>
+        }
+        style={{ width: '90vw', maxWidth: '420px' }}
+        draggable={false}
+        resizable={false}
+        modal
+        contentStyle={{ 
+          padding: window.innerWidth <= 480 ? '24px 20px' : '36px 28px', 
+          textAlign: 'center' 
+        }}
+      >
+        <div style={{ marginTop: '8px' }}>
+          {/* Razón principal */}
+          {steganographyModal.criticalReasons.length > 0 && (
+            <div style={{ 
+              background: '#fee2e2',
+              padding: window.innerWidth <= 480 ? '16px 18px' : '20px 24px',
+              borderRadius: '10px',
+              border: '2px solid #fca5a5',
+              marginBottom: window.innerWidth <= 480 ? '20px' : '28px'
+            }}>
+              <p style={{ 
+                margin: 0,
+                fontSize: window.innerWidth <= 480 ? '14px' : '15px',
+                color: '#991b1b',
+                lineHeight: '1.6',
+                fontWeight: '500'
+              }}>
+                {steganographyModal.criticalReasons[0]
+                  .replace('CRÍTICO: ', '')
+                  .replace('ALTA SOSPECHA: ', '')
+                  .replace('Firmas de herramientas detectadas:', 'Contiene herramientas de ocultamiento')
+                  .replace('Patrón LSB sospechoso detectado - posible esteganografía', 'Se detectaron patrones sospechosos')
+                  .split(':')[0]
+                }
+              </p>
+            </div>
+          )}
+
+          {/* Nivel de detección */}
+          <div style={{ 
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '10px',
+            padding: window.innerWidth <= 480 ? '12px 20px' : '14px 24px',
+            borderRadius: '10px',
+            background: '#fee2e2',
+            border: '2px solid #fca5a5',
+            marginBottom: window.innerWidth <= 480 ? '20px' : '28px'
+          }}>
+            <span style={{ 
+              fontSize: window.innerWidth <= 480 ? '13px' : '14px', 
+              color: '#991b1b', 
+              fontWeight: '600' 
+            }}>Detección:</span>
+            <span style={{ 
+              fontSize: window.innerWidth <= 480 ? '18px' : '20px', 
+              fontWeight: '700', 
+              color: '#dc2626'
+            }}>
+              {steganographyModal.confidence}%
+            </span>
+          </div>
+
+          {/* Mensaje de seguridad */}
+          <div style={{ 
+            padding: window.innerWidth <= 480 ? '14px 18px' : '16px 20px', 
+            background: '#eff6ff', 
+            borderRadius: '10px',
+            border: '2px solid #bfdbfe'
+          }}>
+            <p style={{ 
+              margin: 0, 
+              fontSize: window.innerWidth <= 480 ? '13px' : '14px', 
+              color: '#1e40af',
+              lineHeight: '1.6',
+              fontWeight: '500'
+            }}>
+              Por su seguridad, este archivo no será enviado.
+            </p>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
   

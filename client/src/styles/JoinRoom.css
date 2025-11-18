@@ -155,6 +155,10 @@
   flex-direction: column;
   gap: var(--spacing-xl);
 }
+.app-container.light-theme .card-body {
+  background: var(--light-surface, #ffffff);   /* fondo claro */
+  color: var(--text-primary-light, #111827);   /* texto oscuro */
+}
 
 .input-group {
   position: relative;
@@ -194,7 +198,7 @@
 .card-body input {
   width: 100%;
   padding: var(--spacing-md) var(--spacing-lg);
-  background: rgba(15, 23, 42, 0.8);
+  background: rgba(58, 86, 153, 0.8);
   border: 2px solid var(--dark-border-light, #374151);
   border-radius: var(--radius-lg);
   color: var(--text-primary-dark, #f8fafc);
@@ -292,17 +296,17 @@
   transition: var(--transition);
 }
 
-.card-body button:hover {
+.card-body button:hover:not(:disabled) {
   transform: translateY(-3px);
   box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.4);
   filter: brightness(1.1);
 }
 
-.card-body button:hover::before {
+.card-body button:hover:not(:disabled)::before {
   left: 100%;
 }
 
-.card-body button:active {
+.card-body button:active:not(:disabled) {
   transform: translateY(-1px);
   box-shadow: 0 10px 20px -5px rgba(99, 102, 241, 0.3);
 }
@@ -312,11 +316,25 @@
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+  filter: none;
 }
 
-.card-body button:disabled:hover {
-  filter: none;
-  transform: none;
+/* Tema claro - botón */
+.app-container.light-theme .card-body button {
+  background: var(--primary-gradient);
+  color: white;
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+}
+
+.app-container.light-theme .card-body button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.5);
+  transform: translateY(-3px);
+}
+
+.app-container.light-theme .card-body button:active:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px -5px rgba(99, 102, 241, 0.4);
 }
 
 /* Responsive */

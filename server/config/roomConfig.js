@@ -7,7 +7,7 @@ const ROOM_LIMITS = {
   NAME_MAX_LENGTH: 30,
   NAME_MIN_LENGTH: 3,
   MIN_PARTICIPANTS: 2,
-  MAX_PARTICIPANTS: 10,
+  MAX_PARTICIPANTS: 50,
   MAX_ACTIVE_ROOMS: 15
 };
 
@@ -52,6 +52,9 @@ const ROOM_TYPE_CONFIG = {
         'image/png',
         'image/gif',
         'image/webp',
+        'image/bmp',
+        'image/x-ms-bmp',
+        'image/x-bmp',
         'application/pdf',
         'application/msword',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',

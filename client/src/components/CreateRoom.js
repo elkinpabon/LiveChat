@@ -6,11 +6,11 @@ import 'primereact/resources/primereact.min.css';
 import 'primeicons/primeicons.css';
 import '../styles/CreateRoom.css';
 import '../styles/CustomToast.css';
+import Validators from '../utils/validators';
 
-// Constantes para SonarQube compliance
 const ROOM_NAME_MAX_LENGTH = 30;
 const MIN_PARTICIPANTS = 2;
-const MAX_PARTICIPANTS = 10;
+const MAX_PARTICIPANTS = 50;
 const ROOM_TYPES = {
   TEXT: 'text',
   MULTIMEDIA: 'multimedia'
@@ -77,12 +77,7 @@ const CreateRoom = ({ onRoomCreated, adminToken }) => {
         roomType: roomType,
         maxParticipants: limit
       };
-      
-      console.log('📤 Enviando datos de sala:', payload);
-      console.log('🔍 Tipo de sala seleccionado:', roomType);
-      console.log('🔍 ¿Es TEXT?', roomType === ROOM_TYPES.TEXT);
-      console.log('🔍 ¿Es MULTIMEDIA?', roomType === ROOM_TYPES.MULTIMEDIA);
-      
+            
       const response = await fetch(`${BACKEND_URL}/api/admin/rooms`, {
         method: 'POST',
         headers: {
@@ -159,15 +154,31 @@ const CreateRoom = ({ onRoomCreated, adminToken }) => {
               <FileText size={16} />
               Nombre de la Sala
             </label>
-            <input
-              type="text"
-              className="form-input"
-              value={roomName}
-              onChange={(e) => setRoomName(e.target.value.slice(0, ROOM_NAME_MAX_LENGTH))}
-              maxLength={ROOM_NAME_MAX_LENGTH}
-              placeholder="Ej: Sala de Trabajo"
-              disabled={isCreating}
-            />
+          <input
+  type="text"
+  className="form-input"
+  value={roomName}
+  onChange={(e) => {
+    const raw = e.target.value;
+    const sanitized = Validators.sanitizeRoomName(raw).slice(0, ROOM_NAME_MAX_LENGTH);
+
+    if (raw !== sanitized && toast.current) {
+      toast.current.show({
+        severity: 'warn',
+        summary: 'Formato inválido',
+        detail: 'Solo se permiten letras y un espacio',
+        life: 1800
+      });
+    }
+
+    setRoomName(sanitized);
+  }}
+  maxLength={ROOM_NAME_MAX_LENGTH}
+  placeholder="Ej: Sala de Trabajo"
+  disabled={isCreating}
+/>
+
+
             <small className="input-hint">
               {roomName.length}/{ROOM_NAME_MAX_LENGTH} caracteres
             </small>

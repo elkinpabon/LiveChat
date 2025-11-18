@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 import { Shield, AlertCircle, Sun, Moon } from 'lucide-react';
+import Validators from '../utils/validators';
 import '../styles/AdminLogin.css';
 
 const BACKEND_URL = process.env.REACT_APP_SOCKET_URL || 'http://localhost:3001';
@@ -19,6 +20,12 @@ function AdminLogin({ onLoginSuccess, theme, toggleTheme }) {
   const handleLogin = async (e) => {
     e.preventDefault();
     setError('');
+    // Validar campos antes de enviar
+const vUser = Validators.validateAdminUsername(formData.username);
+    if (!vUser.ok) return setError(vUser.message);
+    const vPass = Validators.validatePassword(formData.password);
+    if (!vPass.ok) return setError(vPass.message);
+
     setLoading(true);
 
     try {
@@ -46,6 +53,10 @@ function AdminLogin({ onLoginSuccess, theme, toggleTheme }) {
   const handleVerify2FA = async (e) => {
     e.preventDefault();
     setError('');
+    // Validar código 2FA antes de enviar
+    const v2 = Validators.validate2FACode(formData.code2fa);
+    if (!v2.ok) return setError(v2.message);
+
     setLoading(true);
 
     try {
@@ -64,29 +75,45 @@ function AdminLogin({ onLoginSuccess, theme, toggleTheme }) {
   };
 
   const handleChange = (e) => {
-    setFormData({
-      ...formData,
-      [e.target.name]: e.target.value
-    });
+    const { name, value } = e.target;
+
+    let newValue = value;
+    if (name === 'username') {
+  newValue = Validators.sanitizeAdminUsername(value);
+
+  // si el usuario intentó meter algo inválido → mostrar error visual
+  if (value !== newValue) {
+    setError('Solo se permiten letras y números en el usuario');
+  } else {
+    setError('');
+  }
+}
+
+
+    setFormData(prev => ({
+      ...prev,
+      [name]: newValue
+    }));
   };
 
   return (
     <div className="admin-login-container">
       <div className="admin-login-card">
+        <button 
+          className="theme-toggle-admin" 
+          onClick={toggleTheme}
+          title={theme === 'dark' ? 'Modo Claro' : 'Modo Oscuro'}
+          type="button"
+        >
+          {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
+        </button>
+        
         <div className="admin-login-header">
           <div className="header-title">
             <Shield size={32} className="header-icon" />
             <h2>Administración LiveChat</h2>
           </div>
           <p>{step === 'login' ? 'Iniciar Sesión' : 'Autenticación 2FA'}</p>
-          <button 
-            className="theme-toggle-admin" 
-            onClick={toggleTheme}
-            title={theme === 'dark' ? 'Modo Claro' : 'Modo Oscuro'}
-            type="button"
-          >
-            {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
-          </button>
         </div>
 
         {error && (

@@ -1,15 +1,32 @@
 const mongoose = require('mongoose');
 
-const DeviceSessionSchema = new mongoose.Schema({
-    deviceId: { type: String, required: true },
-    ip: { type: String, required: true },
-    roomPin: { type: String, required: true },
-    nickname: { type: String, required: true },
-    lastActive: { type: Date, default: Date.now },
-    createdAt: { type: Date, default: Date.now, expires: 86400 }
+const deviceSessionSchema = new mongoose.Schema({
+  deviceId: {
+    type: String,
+    required: true,
+    index: true  
+  },
+  ipAddress: {
+    type: String,
+    required: true
+  },
+  pin: {
+    type: String,
+    required: true,
+    index: true
+  },
+  nickname: { type: String, required: true },
+  lastActive: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now, expires: 86400 }
 });
 
-// indice compuesto para garantizar una sesion unica por ip y sala
-DeviceSessionSchema.index({ ip: 1, roomPin: 1 }, { unique: true });
+// ✅ Índice compuesto para evitar duplicados
+deviceSessionSchema.index({ deviceId: 1, pin: 1 }, { unique: true });
 
-module.exports = mongoose.model('DeviceSession', DeviceSessionSchema);
+// Índice adicional para búsquedas por IP (más rápidas)
+deviceSessionSchema.index({ ipAddress: 1 });
+
+// Índice para limpiar sesiones antiguas
+deviceSessionSchema.index({ lastActive: 1 });
+
+module.exports = mongoose.model('DeviceSession', deviceSessionSchema);

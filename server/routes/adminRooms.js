@@ -22,13 +22,6 @@ router.post('/', async (req, res) => {
   try {
     const { name, roomType, maxParticipants } = req.body;
     const adminId = req.admin.adminId;
-
-    console.log('📥 Solicitud de creación de sala recibida:');
-    console.log('   - Nombre:', name);
-    console.log('   - Tipo recibido:', roomType);
-    console.log('   - Tipo de dato:', typeof roomType);
-    console.log('   - Max participantes:', maxParticipants);
-
     // Validar configuración usando el módulo centralizado
     const validation = validateRoomConfig({ name, roomType, maxParticipants });
     
@@ -80,10 +73,9 @@ router.post('/', async (req, res) => {
     
     await newRoom.save();
 
-    console.log(`✅ Sala creada por admin: ${req.admin.username}`);
+    console.log(`Sala creada por admin: ${req.admin.username}`);
     console.log(`   PIN: ${pin}, Nombre: ${name}, Tipo: ${roomType}`);
     console.log(`   Config multimedia:`, multimediaConfig);
-
     // Notificar a todos los clientes conectados sobre la nueva sala
     const io = req.app.get('io');
     if (io) {
@@ -120,7 +112,7 @@ router.post('/', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error creando sala:', error);
+    console.error(' Error creando sala:', error);
     res.status(500).json({
       success: false,
       message: 'Error al crear la sala',
@@ -135,14 +127,10 @@ router.post('/', async (req, res) => {
  */
 router.get('/', async (req, res) => {
   try {
-    console.log('📥 GET /api/admin/rooms - Solicitado por:', req.admin.username);
-    
     const rooms = await RoomModel.find()
       .select('pin name encryptedId roomType maxParticipants participantCount isActive createdAt lastActivity')
       .sort({ createdAt: -1 })
       .limit(100);
-
-    console.log(`✅ Encontradas ${rooms.length} salas en la base de datos`);
 
     const roomsData = rooms.map(room => ({
       pin: room.pin,
@@ -156,9 +144,6 @@ router.get('/', async (req, res) => {
       lastActivity: room.lastActivity,
       isFull: room.isFull()
     }));
-
-    console.log('📤 Enviando salas:', roomsData);
-
     res.json({
       success: true,
       rooms: roomsData,
@@ -166,7 +151,7 @@ router.get('/', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error obteniendo salas:', error);
+    console.error('Error obteniendo salas:', error);
     res.status(500).json({
       success: false,
       message: 'Error al obtener las salas',
@@ -242,7 +227,7 @@ router.delete('/:pin', async (req, res) => {
     // Marcar como inactiva en lugar de eliminar
     await room.deactivate();
 
-    console.log(`✅ Sala ${pin} eliminada por admin: ${adminUsername}`);
+    console.log(`Sala ${pin} eliminada por admin: ${adminUsername}`);
 
     // Notificar a todos los clientes sobre la sala eliminada
     const io = req.app.get('io');
@@ -288,9 +273,6 @@ router.patch('/:pin/activate', async (req, res) => {
     room.isActive = true;
     room.lastActivity = new Date();
     await room.save();
-
-    console.log(`✅ Sala ${pin} reactivada por admin: ${req.admin.username}`);
-
     res.json({
       success: true,
       message: 'Sala reactivada exitosamente'
@@ -301,6 +283,85 @@ router.patch('/:pin/activate', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error al reactivar la sala'
+    });
+  }
+});
+
+/**
+ * DELETE /api/admin/rooms/:pin/permanent
+ * Eliminar definitivamente una sala y TODOS sus datos asociados
+ * ⚠️ ADVERTENCIA: Esta acción es IRREVERSIBLE
+ * Elimina: sala, mensajes, archivos, sesiones, membresías
+ */
+router.delete('/:pin/permanent', async (req, res) => {
+  try {
+    const { pin } = req.params;
+    const adminUsername = req.admin.username;
+    const Message = require('../models/Message');
+    const DeviceSession = require('../models/DeviceSession');
+    const RoomMembership = require('../models/RoomMembership');
+
+    console.log(`🚨 ELIMINACIÓN DEFINITIVA iniciada por ${adminUsername} para sala ${pin}`);
+
+    const room = await RoomModel.findOne({ pin });
+
+    if (!room) {
+      return res.status(404).json({
+        success: false,
+        message: 'Sala no encontrada'
+      });
+    }
+
+    // Contar datos antes de eliminar
+    const messageCount = await Message.countDocuments({ pin });
+    const sessionCount = await DeviceSession.countDocuments({ pin });
+    const membershipCount = await RoomMembership.countDocuments({ pin });
+
+    // 1. Eliminar todos los mensajes
+    await Message.deleteMany({ pin });
+    console.log(`   ✅ ${messageCount} mensajes eliminados`);
+
+    // 2. Eliminar todas las sesiones de dispositivos
+    await DeviceSession.deleteMany({ pin });
+    console.log(`   ✅ ${sessionCount} sesiones eliminadas`);
+
+    // 3. Eliminar todas las membresías
+    await RoomMembership.deleteMany({ pin });
+    console.log(`   ✅ ${membershipCount} membresías eliminadas`);
+
+    // 4. Notificar a usuarios conectados antes de eliminar
+    const io = req.app.get('io');
+    if (io) {
+      io.to(pin).emit('roomClosedByAdmin', { 
+        message: '⚠️ Esta sala ha sido eliminada definitivamente por un administrador',
+        permanent: true
+      });
+      io.emit('roomDeleted', { pin, permanent: true });
+    }
+
+    // 5. Eliminar la sala definitivamente de la base de datos
+    await RoomModel.deleteOne({ pin });
+    console.log(`   ✅ Sala ${pin} eliminada definitivamente`);
+
+    console.log(`🚨 ELIMINACIÓN DEFINITIVA completada para sala ${pin}`);
+
+    res.json({
+      success: true,
+      message: 'Sala y todos sus datos eliminados definitivamente',
+      deletedData: {
+        messages: messageCount,
+        sessions: sessionCount,
+        memberships: membershipCount,
+        room: room.name
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error en eliminación definitiva:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al eliminar la sala definitivamente',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -329,9 +390,6 @@ router.delete('/:pin/messages', async (req, res) => {
 
     // Eliminar todos los mensajes de la sala
     const result = await Message.deleteMany({ pin });
-
-    console.log(`✅ Admin ${req.admin.username} eliminó ${result.deletedCount} mensajes de sala ${pin}`);
-
     res.json({
       success: true,
       message: `${result.deletedCount} mensajes eliminados exitosamente`,

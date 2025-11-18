@@ -6,16 +6,12 @@ class Room {
     
     // Hash del PIN para almacenamiento seguro (aunque el PIN ya está en memoria)
     this.hashedPin = this._hashPin(pin);
-    
     // ID encriptado único de la sala
     this.encryptedId = this._generateEncryptedId();
-    
     // Nombre de la sala
     this.name = roomName || `Sala ${pin}`;
-    
     // Tipo de sala: 'text' o 'multimedia'
     this.roomType = roomType;
-    
     // Límite de usuarios
     this.limit = limit ? parseInt(limit) : null;
     
@@ -24,6 +20,7 @@ class Room {
       maxFileSize: options.maxFileSize || 15 * 1024 * 1024, // 15MB por defecto
       allowedFileTypes: options.allowedFileTypes || [
         'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+        'image/bmp', 'image/x-ms-bmp', 'image/x-bmp',
         'application/pdf', 'application/msword',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         'video/mp4', 'video/webm',
